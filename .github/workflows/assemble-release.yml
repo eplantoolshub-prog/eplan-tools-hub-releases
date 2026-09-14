@@ -1,0 +1,192 @@
+name: Assemble EPLAN release
+run-name: EPLAN upload ${{ inputs.job_id }}
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        required: true
+        type: string
+      recipe:
+        required: true
+        type: string
+permissions:
+  contents: write
+concurrency:
+  group: eplan-upload-${{ inputs.job_id }}
+  cancel-in-progress: false
+jobs:
+  assemble:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Verify parts and upload the installer to the draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EPLAN_JOB_ID: ${{ inputs.job_id }}
+          EPLAN_RECIPE: ${{ inputs.recipe }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          """Assemble chunks already on GitHub and upload one EXE to a draft release.
+          Runs only on a standard GitHub-hosted Linux runner; never executes the installer.
+          No update signing key or Cloudflare credential is available to this process.
+          """
+          import hashlib
+          import hmac
+          import http.client
+          import json
+          import os
+          import re
+          import tempfile
+          from pathlib import Path
+          from urllib.parse import quote
+          
+          REPO = 'eplantoolshub-prog/eplan-tools-hub-releases'
+          PART_SIZE = 32 * 1024 * 1024
+          
+          
+          def require(test, message):
+              if not test:
+                  raise ValueError(message)
+          
+          
+          def validate_recipe(recipe, job_id):
+              require(isinstance(recipe, dict), 'INVALID_RECIPE')
+              require(re.fullmatch(r'[a-f0-9-]{36}', job_id or '') and recipe.get('id') == job_id, 'JOB_MISMATCH')
+              require(type(recipe.get('release_id')) is int and recipe['release_id'] > 0, 'INVALID_RELEASE')
+              require(re.fullmatch(r'(0|[1-9][0-9]{0,3})\.(0|[1-9][0-9]{0,3})(\.(0|[1-9][0-9]{0,3}))?', recipe.get('version', '')), 'INVALID_VERSION')
+              require(type(recipe.get('size')) is int and 1000000 <= recipe['size'] <= 512 * 1024**2, 'INVALID_SIZE')
+              require(re.fullmatch('[a-f0-9]{64}', recipe.get('sha256', '')), 'INVALID_DIGEST')
+              require(re.fullmatch('[a-f0-9]{40}', recipe.get('commit', '')), 'INVALID_COMMIT')
+              parts = recipe.get('parts')
+              require(isinstance(parts, list) and 1 <= len(parts) <= 16, 'INVALID_PARTS')
+              for i, part in enumerate(parts):
+                  require(isinstance(part, dict) and re.fullmatch('[a-f0-9]{40}', part.get('sha', '')), 'INVALID_PART_SHA')
+                  require(type(part.get('size')) is int and 0 < part['size'] <= PART_SIZE, 'INVALID_PART_SIZE')
+                  require(i == len(parts)-1 or part['size'] == PART_SIZE, 'INVALID_PART_BOUNDARY')
+              require(sum(p['size'] for p in parts) == recipe['size'], 'PARTS_SIZE_MISMATCH')
+              return recipe
+          
+          
+          class GitHub:
+              def __init__(self, token):
+                  self.token = token
+          
+              def request(self, path, method='GET', data=None, accept='application/vnd.github+json'):
+                  require(path.startswith('/repos/' + REPO + '/'), 'INVALID_API_PATH')
+                  connection = http.client.HTTPSConnection('api.github.com', timeout=120)
+                  headers = {'Authorization': 'Bearer ' + self.token, 'Accept': accept,
+                             'X-GitHub-Api-Version': '2022-11-28', 'User-Agent': 'EPLAN-Publisher/0.3'}
+                  body = None
+                  if data is not None:
+                      body = json.dumps(data).encode()
+                      headers['Content-Type'] = 'application/json'
+                  connection.request(method, path, body, headers)
+                  response = connection.getresponse()
+                  require(200 <= response.status < 300, 'GITHUB_HTTP_' + str(response.status))
+                  return connection, response
+          
+              def json(self, path):
+                  connection, response = self.request('/repos/' + REPO + '/' + path)
+                  try:
+                      return json.load(response)
+                  finally:
+                      connection.close()
+          
+              def chunks(self, sha):
+                  connection, response = self.request('/repos/' + REPO + '/git/blobs/' + sha,
+                                                      accept='application/vnd.github.raw+json')
+                  try:
+                      while chunk := response.read(1024 * 1024):
+                          yield chunk
+                  finally:
+                      connection.close()
+          
+              def upload(self, release_id, path, name):
+                  # http.client sends the file as a stream with an exact Content-Length.
+                  connection = http.client.HTTPSConnection('uploads.github.com', timeout=600)
+                  try:
+                      with path.open('rb') as file:
+                          connection.request('POST', '/repos/' + REPO + '/releases/' + str(release_id) + '/assets?name=' + quote(name), file,
+                              {'Authorization': 'Bearer ' + self.token, 'Accept': 'application/vnd.github+json',
+                               'Content-Type': 'application/octet-stream', 'Content-Length': str(path.stat().st_size),
+                               'User-Agent': 'EPLAN-Publisher/0.3'})
+                          response = connection.getresponse()
+                          require(response.status == 201, 'UPLOAD_HTTP_' + str(response.status))
+                          return json.load(response)
+                  finally:
+                      connection.close()
+          
+              def delete(self, path):
+                  connection, response = self.request('/repos/' + REPO + '/' + path, 'DELETE')
+                  response.read()
+                  connection.close()
+          
+          
+          def assemble(recipe, destination, chunks):
+              digest = hashlib.sha256()
+              total = 0
+              with destination.open('wb') as out:
+                  for part in recipe['parts']:
+                      # Git object addressing (SHA-1) in addition to the complete EXE SHA-256.
+                      part_digest = hashlib.sha1(('blob ' + str(part['size']) + '\0').encode())
+                      size = 0
+                      for chunk in chunks(part['sha']):
+                          size += len(chunk)
+                          require(size <= part['size'], 'PART_TOO_LARGE')
+                          part_digest.update(chunk)
+                          digest.update(chunk)
+                          out.write(chunk)
+                      require(size == part['size'] and hmac.compare_digest(part_digest.hexdigest(), part['sha']), 'PART_DIGEST_MISMATCH')
+                      total += size
+                  out.flush()
+                  os.fsync(out.fileno())
+              require(total == recipe['size'] and hmac.compare_digest(digest.hexdigest(), recipe['sha256']), 'INSTALLER_DIGEST_MISMATCH')
+              with destination.open('rb') as file:
+                  require(file.read(2) == b'MZ', 'NOT_WINDOWS_EXE')
+          
+          
+          def run(recipe, api):
+              version = recipe['version']
+              name = 'EPLAN_Tools_Hub_Setup_v' + version.replace('.', '_') + '.exe'
+              release = api.json('releases/' + str(recipe['release_id']))
+              require(release.get('tag_name') == 'v' + version and not release.get('prerelease'), 'RELEASE_MISMATCH')
+              assets = api.json('releases/' + str(recipe['release_id']) + '/assets?per_page=100')
+              found = next((a for a in assets if a['name'] == name), None)
+          
+              def correct(asset):
+                  return asset.get('size') == recipe['size'] and asset.get('state') == 'uploaded' and asset.get('digest') == 'sha256:' + recipe['sha256']
+          
+              if found and correct(found):
+                  return  # A previous run completed, possibly without receiving its response.
+              require(release.get('draft') is True, 'NOT_A_DRAFT')
+              require('<!-- eplan-publication:' + recipe['id'] + ' -->' in release.get('body', ''), 'RELEASE_OWNER_MISMATCH')
+              if found:
+                  require(found.get('state') == 'starter' or found.get('size') == 0, 'DIFFERENT_ASSET_EXISTS')
+                  api.delete('releases/assets/' + str(found['id']))
+              commit = api.json('git/commits/' + recipe['commit'])
+              tree = api.json('git/trees/' + commit['tree']['sha'])
+              expected = {'part-' + str(i).zfill(3) + '.bin': part['sha'] for i, part in enumerate(recipe['parts'])}
+              require(not tree.get('truncated') and {item['path']: item['sha'] for item in tree['tree']} == expected, 'STAGING_TREE_MISMATCH')
+              with tempfile.TemporaryDirectory(prefix='eplan-upload-') as temp:
+                  path = Path(temp) / name
+                  assemble(recipe, path, api.chunks)
+                  asset = api.upload(recipe['release_id'], path, name)
+                  require(correct(asset), 'UPLOADED_DIGEST_MISMATCH')
+              # Only temporary upload data is released. Main and release tags are untouched.
+              ref = api.json('git/ref/heads/uploads/' + recipe['id'])
+              require(ref['object']['sha'] == recipe['commit'], 'STAGING_REF_CHANGED')
+              api.delete('git/refs/heads/uploads/' + recipe['id'])
+              print('Installer uploaded and verified. Release remains a draft until the owner panel confirms it.')
+          
+          
+          if __name__ == '__main__':
+              try:
+                  require(os.environ.get('GITHUB_REPOSITORY') == REPO, 'WRONG_REPOSITORY')
+                  recipe = validate_recipe(json.loads(os.environ['EPLAN_RECIPE']), os.environ['EPLAN_JOB_ID'])
+                  run(recipe, GitHub(os.environ['GH_TOKEN']))
+              except Exception as error:
+                  # Provider responses, tokens and redirect URLs never enter workflow logs.
+                  print('EPLAN assembly failed:', str(error) if isinstance(error, ValueError) else type(error).__name__)
+                  raise SystemExit(1)
+          PY
